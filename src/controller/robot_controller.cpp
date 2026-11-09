@@ -22,71 +22,77 @@ constexpr float    VEL_PID_MAX = 100.0f;
 constexpr float    DEADBAND_TPS = 20.0f;
 constexpr float    MEAS_ALPHA   = 0.5f;
 
-// --- Khởi động (đứng yên -> quay) ---
-constexpr int16_t  START_PWM_L  = 160;     // ĐO LẠI trên sàn thật, cộng dư 10-15
+// --- Khởi động từ đứng yên ---
+constexpr int16_t  START_PWM_L  = 160;     // ĐO LẠI trên sàn thật
 constexpr int16_t  START_PWM_R  = 170;
-constexpr float    KICK_STEP    = 2.0f;    // mỗi 20 ms chưa quay thì +2 PWM
-constexpr float    KICK_MAX     = 60.0f;   // tối đa cộng thêm
-constexpr float    MOVING_ON    = 80.0f;   // |meas| > mức này => coi là đang quay
-constexpr float    MOVING_OFF   = 40.0f;   // |meas| < mức này => quay lại chế độ khởi động
+constexpr float    STILL_TPS    = 30.0f;   // |meas| dưới mức này = đứng yên
+constexpr uint8_t  STILL_CYCLES = 5;       // đứng yên liên tục 100 ms mới dùng START_PWM
+constexpr float    RELEASE_TPS  = 80.0f;   // vượt mức này thì thoát chế độ khởi động
 
-// --- Khi đang quay ---
-constexpr int16_t  RUN_MIN_PWM  = 60;      // sàn thấp để PID còn chỗ hạ PWM
+// --- Sàn PWM khi đang chạy: gần PWM duy trì thực tế trên sàn ---
+constexpr float    RUN_FLOOR_L  = 110.0f;   // ĐO LẠI (PWM thấp nhất mà bánh vẫn quay đều)
+constexpr float    RUN_FLOOR_R  = 120.0f;
 
-// --- Feedforward riêng từng bánh: PWM = off + k * tps ---
-constexpr float    FF_OFF_L     = 60.0f;   // ước từ log: ~112 PWM tại 1000 tps
-constexpr float    FF_OFF_R     = 90.0f;   //            ~142 PWM tại 1000 tps
-constexpr float    FF_K         = 0.052f;  // ước lượng, PID sẽ bù phần sai
+// --- Chống kẹt: bánh chậm hơn target nhiều thì cộng thêm PWM, hết kẹt thì giảm dần ---
+constexpr float    STALL_RATIO  = 0.4f;
+constexpr float    KICK_STEP    = 3.0f;
+constexpr float    KICK_DECAY   = 0.5f;
+constexpr float    KICK_MAX     = 70.0f;
 
-// --- Ramp ---
-constexpr float    ACCEL_TPS2   = 4000.0f; // đạt 1000 tps trong 0.25 s
+// --- Feedforward riêng từng bánh ---
+constexpr float    FF_OFF_L     = 60.0f;
+constexpr float    FF_OFF_R     = 90.0f;
+constexpr float    FF_K         = 0.052f;
 
+constexpr float    ACCEL_TPS2   = 4000.0f;
+}
 struct WheelState {
-    float ramp   = 0.0f;   // target sau ramp (ticks/s, có dấu)
-    float kick   = 0.0f;   // PWM cộng thêm khi bánh kẹt ở trạng thái khởi động
-    bool  moving = false;
+    float   ramp      = 0.0f;
+    float   kick      = 0.0f;
+    uint8_t still_cnt = STILL_CYCLES;   // lần đầu coi như đang đứng yên
+    bool    started   = false;          // đã thoát chế độ khởi động
 };
 WheelState g_ws_left, g_ws_right;
 
 int16_t speed_to_pwm(int16_t target, float measured, PID &pid,
-                     WheelState &ws, int16_t start_pwm, float ff_off)
+                     WheelState &ws, int16_t start_pwm, float ff_off, float run_floor)
 {
-    // target ~ 0: dừng hẳn, reset mọi trạng thái
     if (fabsf((float)target) < DEADBAND_TPS) {
         pid.reset();
-        ws.ramp = 0.0f; ws.kick = 0.0f; ws.moving = false;
+        ws.ramp = 0.0f; ws.kick = 0.0f;
+        ws.still_cnt = STILL_CYCLES; ws.started = false;
         return 0;
     }
     const float sign = (target > 0) ? 1.0f : -1.0f;
 
-    // Ramp target
+    // Ramp
     const float step = ACCEL_TPS2 * DT;
     ws.ramp += constrain((float)target - ws.ramp, -step, step);
-    const float ramp_mag = fmaxf(0.0f, ws.ramp * sign);   // chỉ lấy phần cùng chiều target
+    const float ramp_mag = fmaxf(0.0f, ws.ramp * sign);
+    const float meas_mag = fmaxf(0.0f, measured * sign);   // tốc độ cùng chiều target
 
-    // Hysteresis: đang quay hay chưa
-    if (!ws.moving && fabsf(measured) > MOVING_ON)  ws.moving = true;
-    if ( ws.moving && fabsf(measured) < MOVING_OFF) ws.moving = false;
+    // Đếm số chu kỳ bánh đứng yên liên tục
+    if (meas_mag < STILL_TPS) { if (ws.still_cnt < 255) ++ws.still_cnt; }
+    else                      { ws.still_cnt = 0; }
+    if (meas_mag > RELEASE_TPS) ws.started = true;
+    if (ws.still_cnt >= STILL_CYCLES) ws.started = false;
 
-    const float ff = ff_off + FF_K * ramp_mag;            // độ lớn, chưa có dấu
-    float out_mag;
-
-    if (!ws.moving) {
-        // Giai đoạn khởi động: PWM đủ lớn để thắng ma sát tĩnh, tăng dần nếu bánh vẫn đứng.
-        // Không chạy PID để integral không windup.
-        pid.reset();
+    // Chống kẹt: chỉ tăng kick khi ramp đã đủ lớn mà bánh vẫn chậm
+    if (ramp_mag > 100.0f && meas_mag < STALL_RATIO * ramp_mag)
         ws.kick = fminf(ws.kick + KICK_STEP, KICK_MAX);
-        out_mag = fmaxf(ff, (float)start_pwm + ws.kick);
-    } else {
-        ws.kick = 0.0f;
-        const float fb = pid.update(sign * ramp_mag - measured, DT) * sign;
-        out_mag = fmaxf(ff + fb, (float)RUN_MIN_PWM);
-    }
+    else
+        ws.kick = fmaxf(ws.kick - KICK_DECAY, 0.0f);
+
+    // PID luôn chạy (không reset khi đang chạy)
+    const float fb = pid.update(sign * ramp_mag - measured, DT) * sign;
+    const float ff = (ramp_mag > 1.0f) ? (ff_off + FF_K * ramp_mag) : 0.0f;
+
+    float out_mag = ff + fb + ws.kick;
+    const float floor_pwm = ws.started ? run_floor : (float)start_pwm;
+    if (out_mag < floor_pwm) out_mag = floor_pwm;
 
     return (int16_t)constrain(sign * out_mag, -255.0f, 255.0f);
 }
-
-} // namespace
 
 // CODE BLOCK FOR TEST
 #if DEBUG_TEST
@@ -120,7 +126,7 @@ uint32_t dbg_window_ratio_count = 0;
 bool dbg_pwm_clamped(int16_t pwm)
 {
     const int value = abs((int)pwm);
-    return pwm != 0 && (value == RUN_MIN_PWM || value == 255);
+    return pwm != 0 && (value == (int)RUN_FLOOR_L || value == (int)RUN_FLOOR_R || value == 255);
 }
 }
 
@@ -244,9 +250,9 @@ void RobotController::update()
 
     // PID từng bánh
     const int16_t pl = speed_to_pwm(_target_left_tps,  _meas_left_tps,  _pid_left,
-                                g_ws_left,  START_PWM_L, FF_OFF_L);
+                                g_ws_left,  START_PWM_L, FF_OFF_L, RUN_FLOOR_L);
     const int16_t pr = speed_to_pwm(_target_right_tps, _meas_right_tps, _pid_right,
-                                g_ws_right, START_PWM_R, FF_OFF_R);
+                                g_ws_right, START_PWM_R, FF_OFF_R, RUN_FLOOR_R);
 
     // CODE BLOCK FOR TEST
     #if DEBUG_TEST
